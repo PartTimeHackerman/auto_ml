@@ -34,4 +34,5 @@ def test_generator():
                 test_model_name = model_name + 'Regressor'
 
             test.description = str(test_model_name) + '_' + test_name
+            print(test.description)
             yield test, test_model_name

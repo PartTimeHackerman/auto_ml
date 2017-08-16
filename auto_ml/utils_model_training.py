@@ -1,19 +1,23 @@
+import os
+import warnings
 from collections import Iterable
 from copy import deepcopy
-import os
-import random
 
 import numpy as np
 import pandas as pd
 import scipy
+import tensorflow
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.model_selection import train_test_split
-import warnings
+from tensorflow.contrib.layers import real_valued_column
+from tensorflow.contrib.learn import infer_real_valued_columns_from_input
 
+from TFDNNRegressor import TFDNNRegressor
 from auto_ml import utils_models
 from auto_ml.utils_models import get_name_from_model
-keras_imported = False
 
+keras_imported = False
+tf_imported = False
 
 # This is the Air Traffic Controller (ATC) that is a wrapper around sklearn estimators.
 # In short, it wraps all the methods the pipeline will look for (fit, score, predict, predict_proba, etc.)
@@ -21,9 +25,10 @@ keras_imported = False
 # It also gives us more granular control over things like turning the input for GradientBoosting into dense matrices, or appending a set of dummy 1's to the end of sparse matrices getting predictions from XGBoost.
 
 class FinalModelATC(BaseEstimator, TransformerMixin):
-
-
-    def __init__(self, model, model_name=None, ml_for_analytics=False, type_of_estimator='classifier', output_column=None, name=None, _scorer=None, training_features=None, column_descriptions=None, feature_learning=False, uncertainty_model=None, uc_results = None, training_prediction_intervals=False, min_step_improvement=0.0001, interval_predictors=None, keep_cat_features=False):
+    def __init__(self, model, model_name=None, ml_for_analytics=False, type_of_estimator='classifier',
+                 output_column=None, name=None, _scorer=None, training_features=None, column_descriptions=None,
+                 feature_learning=False, uncertainty_model=None, uc_results=None, training_prediction_intervals=False,
+                 min_step_improvement=0.0001, interval_predictors=None, keep_cat_features=False):
 
         self.model = model
         self.model_name = model_name
@@ -40,12 +45,10 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
         self.interval_predictors = interval_predictors
         self.keep_cat_features = keep_cat_features
 
-
         if self.type_of_estimator == 'classifier':
             self._scorer = _scorer
         else:
             self._scorer = _scorer
-
 
     def get(self, prop_name, default=None):
         try:
@@ -53,14 +56,17 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
         except AttributeError:
             return default
 
-
     def fit(self, X, y):
-        global keras_imported, KerasRegressor, KerasClassifier
+        global keras_imported, tf_imported, KerasRegressor, KerasClassifier
         self.model_name = get_name_from_model(self.model)
 
         X_fit = X
 
-        if self.model_name[:12] == 'DeepLearning' or self.model_name in ['BayesianRidge', 'LassoLars', 'OrthogonalMatchingPursuit', 'ARDRegression', 'Perceptron', 'PassiveAggressiveClassifier', 'SGDClassifier', 'RidgeClassifier', 'LogisticRegression']:
+        if self.model_name[:12] == 'DeepLearning' or self.model_name[:2] == 'TF' or self.model_name in ['BayesianRidge', 'LassoLars',
+                                                                         'OrthogonalMatchingPursuit', 'ARDRegression',
+                                                                         'Perceptron', 'PassiveAggressiveClassifier',
+                                                                         'SGDClassifier', 'RidgeClassifier',
+                                                                         'LogisticRegression']:
             if scipy.sparse.issparse(X_fit):
                 X_fit = X_fit.todense()
 
@@ -72,7 +78,6 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
                     from keras.wrappers.scikit_learn import KerasRegressor, KerasClassifier
                     keras_imported = True
 
-
                 # For Keras, we need to tell it how many input nodes to expect, which is our num_cols
                 num_cols = X_fit.shape[1]
 
@@ -80,14 +85,31 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
                 del model_params['build_fn']
 
                 if self.type_of_estimator == 'regressor':
-                    self.model = KerasRegressor(build_fn=utils_models.make_deep_learning_model, num_cols=num_cols, feature_learning=self.feature_learning, **model_params)
+                    self.model = KerasRegressor(build_fn=utils_models.make_deep_learning_model, num_cols=num_cols,
+                                                feature_learning=self.feature_learning, **model_params)
                 elif self.type_of_estimator == 'classifier':
-                    self.model = KerasClassifier(build_fn=utils_models.make_deep_learning_classifier, num_cols=num_cols, feature_learning=self.feature_learning, **model_params)
+                    self.model = KerasClassifier(build_fn=utils_models.make_deep_learning_classifier, num_cols=num_cols,
+                                                 feature_learning=self.feature_learning, **model_params)
+
+            if self.model_name[:2] == 'TF':
+                # For Keras, we need to tell it how many input nodes to expect, which is our num_cols
+                num_cols = X_fit.shape[1]
+
+                model_params = self.model.get_params()
+
+                if self.type_of_estimator == 'regressor':
+                    hidden_units = utils_models.get_TF_hidden_units(num_cols=num_cols, feature_learning=self.feature_learning)
+
+                    model_params['hidden_units'] = hidden_units
+                    model_params['feature_columns'] = infer_real_valued_columns_from_input(np.asarray(X_fit))
+                    del model_params['head']
+                    self.model = TFDNNRegressor(**model_params)
 
         try:
             if self.model_name[:12] == 'DeepLearning':
 
-                print('\nWe will stop training early if we have not seen an improvement in training accuracy in 25 epochs')
+                print(
+                    '\nWe will stop training early if we have not seen an improvement in training accuracy in 25 epochs')
                 from keras.callbacks import EarlyStopping
                 early_stopping = EarlyStopping(monitor='loss', patience=25, verbose=1)
                 self.model.fit(X_fit, y, callbacks=[early_stopping])
@@ -104,9 +126,10 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
                     else:
                         eval_metric = 'binary_logloss'
 
-
                 cat_feature_indices = self.get_categorical_feature_indices()
-                self.model.fit(X_fit, y, eval_set=[(X_test, y_test)], early_stopping_rounds=50, eval_metric=eval_metric, eval_names=['random_holdout_set_from_training_data'], categorical_feature=cat_feature_indices)
+                self.model.fit(X_fit, y, eval_set=[(X_test, y_test)], early_stopping_rounds=50, eval_metric=eval_metric,
+                               eval_names=['random_holdout_set_from_training_data'],
+                               categorical_feature=cat_feature_indices)
 
             elif self.model_name[:8] == 'CatBoost':
                 X_fit = X_fit.toarray()
@@ -133,7 +156,9 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
                 if os.environ.get('is_test_suite', False) == 'True':
                     num_iters = list(range(1, 50, 1)) + list(range(50, 100, 2)) + list(range(100, 250, 3))
                 else:
-                    num_iters = list(range(1, 50, 1)) + list(range(50, 100, 2)) + list(range(100, 250, 3)) + list(range(250, 500, 5)) + list(range(500, 1000, 10)) + list(range(1000, 2000, 20)) + list(range(2000, 10000, 100))
+                    num_iters = list(range(1, 50, 1)) + list(range(50, 100, 2)) + list(range(100, 250, 3)) + list(
+                        range(250, 500, 5)) + list(range(500, 1000, 10)) + list(range(1000, 2000, 20)) + list(
+                        range(2000, 10000, 100))
 
                 try:
                     for num_iter in num_iters:
@@ -158,15 +183,18 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
                             best_model = deepcopy(self.model)
                         else:
                             num_worse_rounds += 1
-                        print('[' + str(num_iter) + '] random_holdout_set_from_training_data\'s score is: ' + str(round(val_loss, 3)))
+                        print('[' + str(num_iter) + '] random_holdout_set_from_training_data\'s score is: ' + str(
+                            round(val_loss, 3)))
                         if num_worse_rounds >= patience:
                             break
                 except KeyboardInterrupt:
-                    print('Heard KeyboardInterrupt. Stopping training, and using the best checkpointed GradientBoosting model')
+                    print(
+                        'Heard KeyboardInterrupt. Stopping training, and using the best checkpointed GradientBoosting model')
                     pass
 
                 self.model = best_model
-                print('The number of estimators that were the best for this training dataset: ' + str(self.model.get_params()['n_estimators']))
+                print('The number of estimators that were the best for this training dataset: ' + str(
+                    self.model.get_params()['n_estimators']))
                 print('The best score on a random 15 percent holdout set of the training data: ' + str(best_val_loss))
 
             else:
@@ -180,7 +208,8 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
         except KeyboardInterrupt as e:
             print('Stopping training at this point because we heard a KeyboardInterrupt')
             print('If the model is functional at this point, we will output the model in its latest form')
-            print('Note that not all models can be interrupted and still used, and that this feature generally is an unofficial beta-release feature that is known to fail on occasion')
+            print(
+                'Note that not all models can be interrupted and still used, and that this feature generally is an unofficial beta-release feature that is known to fail on occasion')
             pass
 
         return self
@@ -198,8 +227,10 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
     def verify_features(self, X, raw_features_only=False):
 
         if self.column_descriptions is None:
-            print('This feature is not enabled by default. Depending on the shape of the training data, it can add hundreds of KB to the saved file size.')
-            print('Please pass in `ml_predictor.train(data, verify_features=True)` when training a model, and we will enable this function, at the cost of a potentially larger file size.')
+            print(
+                'This feature is not enabled by default. Depending on the shape of the training data, it can add hundreds of KB to the saved file size.')
+            print(
+                'Please pass in `ml_predictor.train(data, verify_features=True)` when training a model, and we will enable this function, at the cost of a potentially larger file size.')
             warnings.warn('Please pass verify_features=True when invoking .train() on the ml_predictor instance.')
             return None
 
@@ -268,7 +299,8 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
 
         if print_nlp_warning == True:
             print('\n\nWe found an NLP column in the training data')
-            print('verify_features() currently does not support checking all of the values within an NLP column, so if the text of your NLP column has dramatically changed, you will have to check that yourself.')
+            print(
+                'verify_features() currently does not support checking all of the values within an NLP column, so if the text of your NLP column has dramatically changed, you will have to check that yourself.')
             print('Here is one example of an NLP feature in the training data:')
             print(nlp_example)
 
@@ -301,7 +333,8 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
             print(sorted(list(prediction_not_training)))
 
             if len(ignored_features) > 0:
-                print('\n\nAdditionally, we found features in the prediction data that we were told to ignore in the training data')
+                print(
+                    '\n\nAdditionally, we found features in the prediction data that we were told to ignore in the training data')
                 print(sorted(list(ignored_features)))
 
         else:
@@ -313,10 +346,12 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
             , 'prediction_not_training': prediction_not_training
         }
 
-
     def score(self, X, y, verbose=False):
         # At the time of writing this, GradientBoosting does not support sparse matrices for predictions
-        if (self.model_name[:16] == 'GradientBoosting' or self.model_name in ['BayesianRidge', 'LassoLars', 'OrthogonalMatchingPursuit', 'ARDRegression']) and scipy.sparse.issparse(X):
+        if (self.model_name[:16] == 'GradientBoosting' or self.model_name in ['BayesianRidge', 'LassoLars',
+                                                                              'OrthogonalMatchingPursuit',
+                                                                              'ARDRegression']) and scipy.sparse.issparse(
+                X):
             X = X.todense()
 
         if self._scorer is not None:
@@ -329,10 +364,10 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
         else:
             return self.model.score(X, y)
 
-
     def predict_proba(self, X, verbose=False):
 
-        if (self.model_name[:16] == 'GradientBoosting' or self.model_name[:12] == 'DeepLearning' or self.model_name in ['BayesianRidge', 'LassoLars', 'OrthogonalMatchingPursuit', 'ARDRegression']) and scipy.sparse.issparse(X):
+        if (self.model_name[:16] == 'GradientBoosting' or self.model_name[:12] == 'DeepLearning' or self.model_name in [
+            'BayesianRidge', 'LassoLars', 'OrthogonalMatchingPursuit', 'ARDRegression']) and scipy.sparse.issparse(X):
             X = X.todense()
         elif self.model_name[:8] == 'CatBoost' and scipy.sparse.issparse(X):
             X = X.toarray()
@@ -363,11 +398,10 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
             tupled_predictions = []
             for prediction in predictions:
                 if prediction == 1:
-                    tupled_predictions.append([0,1])
+                    tupled_predictions.append([0, 1])
                 else:
-                    tupled_predictions.append([1,0])
+                    tupled_predictions.append([1, 0])
             predictions = tupled_predictions
-
 
         # This handles an annoying edge case with libraries like Keras that, for a binary classification problem, with return a single predicted probability in a list, rather than the probability of both classes in a list
         if len(predictions[0]) == 1:
@@ -383,7 +417,8 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
 
     def predict(self, X, verbose=False):
 
-        if (self.model_name[:16] == 'GradientBoosting' or self.model_name[:12] == 'DeepLearning' or self.model_name in ['BayesianRidge', 'LassoLars', 'OrthogonalMatchingPursuit', 'ARDRegression']) and scipy.sparse.issparse(X):
+        if (self.model_name[:16] == 'GradientBoosting' or self.model_name[:12] == 'DeepLearning' or self.model_name in [
+            'BayesianRidge', 'LassoLars', 'OrthogonalMatchingPursuit', 'ARDRegression']) and scipy.sparse.issparse(X):
             X_predict = X.todense()
         elif self.model_name[:8] == 'CatBoost' and scipy.sparse.issparse(X):
             X_predict = X.toarray()
@@ -412,7 +447,8 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
         if self.interval_predictors is None:
             print('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
             print('This model was not trained to predict intervals')
-            print('Please follow the documentation to tell this model at training time to learn how to predict intervals')
+            print(
+                'Please follow the documentation to tell this model at training time to learn how to predict intervals')
             print('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
             raise ValueError('This model was not trained to predict intervals')
 
@@ -460,7 +496,6 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
                 df = pd.DataFrame(dict_for_df)
                 return df
 
-
     # transform is initially designed to be used with feature_learning
     def transform(self, X):
         predicted_features = self.predict(X)
@@ -477,7 +512,8 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
         if self.uncertainty_model is None:
             print('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
             print('This model was not trained to predict uncertainties')
-            print('Please follow the documentation to tell this model at training time to learn how to predict uncertainties')
+            print(
+                'Please follow the documentation to tell this model at training time to learn how to predict uncertainties')
             print('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
             raise ValueError('This model was not trained to predict uncertainties')
 
@@ -497,8 +533,6 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
             'base_prediction': base_predictions
             , 'uncertainty_prediction': uncertainty_predictions
         }
-
-
 
         if isinstance(base_predictions, Iterable):
 
@@ -537,15 +571,10 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
                     results.update(bucket_result)
                     del results['max_proba']
 
-
-
-
         return results
-
 
     def score_uncertainty(self, X, y, verbose=False):
         return self.uncertainty_model.score(X, y, verbose=False)
-
 
     def get_categorical_feature_indices(self):
         cat_feature_indices = None
@@ -554,9 +583,3 @@ class FinalModelATC(BaseEstimator, TransformerMixin):
             cat_feature_indices = [self.training_features.index(cat_name) for cat_name in cat_feature_names]
 
         return cat_feature_indices
-
-
-
-
-
-

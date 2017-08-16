@@ -7,11 +7,8 @@ sys.path = [os.path.abspath(os.path.dirname(__file__))] + sys.path
 from auto_ml import Predictor
 from auto_ml.utils_models import load_ml_model
 
-
-import dill
 import numpy as np
 import pandas as pd
-from nose.tools import assert_equal, assert_not_equal, with_setup
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 
